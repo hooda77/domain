@@ -1,1 +1,1 @@
-http://egypt-api.dev7.pro/
+http://egypt-api.dev7.pro
