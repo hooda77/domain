@@ -55,12 +55,14 @@ log "النظام: ${PRETTY_NAME:-غير معروف}"
 #  1) قراءة الإعدادات (env أو تفاعليًا)
 # ============================================================================
 NONINTERACTIVE="${MEET_NONINTERACTIVE:-0}"
+# عند التشغيل عبر «curl | bash» يكون stdin هو الأنبوب لا الطرفية،
+# لذا نقرأ من /dev/tty مباشرة إن كانت متاحة (وإلا نستخدم الافتراضي)
 ask(){ # ask VAR "السؤال" "الافتراضي"
   local __var="$1" __q="$2" __def="${3:-}" __ans=""
   local __cur="${!__var:-}"
   if [ -n "$__cur" ]; then eval "$__var=\$__cur"; return; fi
-  if [ "$NONINTERACTIVE" = "1" ] || [ ! -t 0 ]; then eval "$__var=\$__def"; return; fi
-  read -rp "$__q [${__def}]: " __ans </dev/tty || true
+  if [ "$NONINTERACTIVE" = "1" ] || [ ! -r /dev/tty ]; then eval "$__var=\$__def"; return; fi
+  read -rp "$__q [${__def}]: " __ans </dev/tty >/dev/tty 2>&1 || true
   eval "$__var=\${__ans:-\$__def}"
 }
 
@@ -83,7 +85,7 @@ log "الإعدادات: APP=$APP_DOMAIN  LIVEKIT=$LIVEKIT_DOMAIN  IP=$PUBLIC_IP
 # ============================================================================
 #  2) تحديد مصدر ملفات المشروع (محلي أو تنزيل الحزمة)
 # ============================================================================
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo "$PWD")"
 find_src(){ # يبحث عن مجلد يحوي backend/ و public/
   for d in "$SCRIPT_DIR" "$SCRIPT_DIR/.." "$PWD"; do
     if [ -d "$d/backend" ] && [ -d "$d/public" ]; then (cd "$d" && pwd); return 0; fi
@@ -94,10 +96,21 @@ if SRC_DIR="$(find_src)"; then
   ok "مصدر الملفات محليًا: $SRC_DIR"
 elif [ -n "${BUNDLE_URL:-}" ]; then
   log "تنزيل الحزمة من: $BUNDLE_URL"
-  apt-get install -y -q curl unzip >/dev/null 2>&1 || true
   TMPD="$(mktemp -d)"; trap 'rm -rf "$TMPD"' EXIT
   curl -fL --retry 3 -o "$TMPD/bundle.zip" "$BUNDLE_URL" || die "تعذّر تنزيل الحزمة من BUNDLE_URL"
-  unzip -q "$TMPD/bundle.zip" -d "$TMPD/x" || die "الحزمة تالفة أو ليست zip"
+  mkdir -p "$TMPD/x"
+  # فكّ الضغط: unzip إن وُجد، وإلا ثبّته، وإلا استخدم python3 كخطة بديلة
+  if ! command -v unzip >/dev/null 2>&1; then
+    apt-get update -y >/dev/null 2>&1 || true
+    apt-get install -y unzip >/dev/null 2>&1 || true
+  fi
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -q "$TMPD/bundle.zip" -d "$TMPD/x" || die "تعذّر فكّ الحزمة (unzip)"
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$TMPD/bundle.zip" "$TMPD/x" || die "تعذّر فكّ الحزمة (python3)"
+  else
+    die "لا يوجد unzip ولا python3 لفكّ الحزمة."
+  fi
   # ابحث عن جذر المشروع داخل ما فُكّ (قد يكون داخل مجلد فرعي)
   ROOT="$(find "$TMPD/x" -maxdepth 3 -type d -name backend -printf '%h\n' 2>/dev/null | head -1)"
   [ -n "$ROOT" ] && [ -d "$ROOT/public" ] || die "لم أجد backend/ و public/ داخل الحزمة"
