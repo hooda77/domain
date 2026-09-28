@@ -32,20 +32,37 @@ ENV_FILE="$APP_DIR/.env"
 CRED_FILE="/root/meet-credentials.txt"
 LOG_FILE="/var/log/meet-install.log"
 
-# ---- ألوان وتسجيل ----
-if [ -t 1 ]; then C0='\033[0m'; C1='\033[1;36m'; CG='\033[1;32m'; CY='\033[1;33m'; CR='\033[1;31m'; else C0='' C1='' CG='' CY='' CR=''; fi
-_ts(){ date '+%H:%M:%S'; }
-log(){ printf "${C1}==>${C0} %s\n" "$*"; printf '[%s] STEP %s\n' "$(_ts)" "$*" >>"$LOG_FILE" 2>/dev/null || true; }
-ok(){  printf "${CG} ✓${C0} %s\n" "$*"; }
-warn(){ printf "${CY} !${C0} %s\n" "$*"; }
-err(){ printf "${CR} ✗${C0} %s\n" "$*" >&2; }
-die(){ err "$*"; echo "راجع السجل: $LOG_FILE"; exit 1; }
+# ---- ألوان ----
+if [ -t 1 ]; then C0='\033[0m'; C1='\033[1;36m'; CG='\033[1;32m'; CY='\033[1;33m'; CR='\033[1;31m'; CD='\033[2m'; CB='\033[1m'; else C0='' C1='' CG='' CY='' CR='' CD='' CB=''; fi
 
 export DEBIAN_FRONTEND=noninteractive
 mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
 : >"$LOG_FILE" 2>/dev/null || true
-exec > >(tee -a "$LOG_FILE") 2>&1
-trap 'err "فشل عند السطر $LINENO (الأمر: $BASH_COMMAND)"' ERR
+
+# احفظ الطرفية على fd 3، ثم وجّه كل مخرجات الأوامر (apt/composer…) إلى السجل فقط
+# ليبقى ما يراه المستخدم نظيفًا واحترافيًا.
+exec 3>&1
+exec >>"$LOG_FILE" 2>&1
+
+_ts(){ date '+%H:%M:%S'; }
+say(){ printf "$@" >&3; }                                  # سطر نظيف على الشاشة
+log(){ printf '[%s] %s\n' "$(_ts)" "$*"; }                 # للسجل فقط
+ok(){  log "OK: $*"; }
+warn(){ log "WARN: $*"; }
+err(){ log "ERR: $*"; }
+die(){ log "FATAL: $*"; say "\r  ${CR}✗${C0} %s\n" "$*"; say "  ${CD}راجع السجل: %s${C0}\n" "$LOG_FILE"; exit 1; }
+
+trap 'log "فشل عند السطر $LINENO (الأمر: $BASH_COMMAND)"' ERR
+
+# مؤشّر دوّار أثناء تنفيذ خطوة (يُخفي الإخراج المطوّل)
+_spin(){
+  local pid="$1" msg="$2" f='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    i=$(( (i+1) % ${#f} ))
+    say "\r  ${C1}%s${C0} %s" "${f:$i:1}" "$msg"
+    sleep 0.1
+  done
+}
 
 # ============================================================================
 #  0) فحوص أولية
@@ -54,6 +71,15 @@ trap 'err "فشل عند السطر $LINENO (الأمر: $BASH_COMMAND)"' ERR
 if ! command -v apt-get >/dev/null 2>&1; then die "هذا المثبّت لـ Ubuntu/Debian فقط (apt-get غير موجود)."; fi
 . /etc/os-release 2>/dev/null || true
 log "النظام: ${PRETTY_NAME:-غير معروف}"
+
+# وضع التشغيل: تحديث (يوجد .env سابق) أم تثبيت جديد
+if [ -f "$ENV_FILE" ]; then MODE="update"; MODE_AR="تحديث"; else MODE="fresh"; MODE_AR="تثبيت جديد"; fi
+
+# لافتة نظيفة
+say "\n"
+say "  ${CB}${C1}منصّة الاجتماعات${C0}  ${CD}·  المثبّت الاحترافي${C0}\n"
+say "  ${CD}────────────────────────────────────────${C0}\n"
+say "  الوضع: ${CB}%s${C0}   ${CD}النظام: %s${C0}\n\n" "$MODE_AR" "${PRETTY_NAME:-Linux}"
 
 # ============================================================================
 #  1) قراءة الإعدادات (env أو تفاعليًا)
@@ -66,7 +92,8 @@ ask(){ # ask VAR "السؤال" "الافتراضي"
   local __cur="${!__var:-}"
   if [ -n "$__cur" ]; then eval "$__var=\$__cur"; return; fi
   if [ "$NONINTERACTIVE" = "1" ] || [ ! -r /dev/tty ]; then eval "$__var=\$__def"; return; fi
-  read -rp "$__q [${__def}]: " __ans </dev/tty >/dev/tty 2>&1 || true
+  printf "  ${C1}?${C0} %s ${CD}[%s]${C0} " "$__q" "$__def" >/dev/tty
+  read -r __ans </dev/tty || true
   eval "$__var=\${__ans:-\$__def}"
 }
 
@@ -75,16 +102,20 @@ detect_ip(){ curl -fsS4 https://api.ipify.org 2>/dev/null || curl -fsS4 https://
 PUBLIC_IP="${PUBLIC_IP:-$(detect_ip)}"
 
 # لو يوجد .env سابق حمّل قيمه (حفاظًا على الأسرار والدومين)
-if [ -f "$ENV_FILE" ]; then set -a; . "$ENV_FILE"; set +a; ok "تم العثور على إعداد سابق ($ENV_FILE) — سيُعاد استخدام الأسرار."; fi
+if [ "$MODE" = "update" ]; then
+  set -a; . "$ENV_FILE"; set +a
+  say "  ${CG}✓${C0} إعداد سابق موجود — سيُعاد استخدام الأسرار والدومين.\n\n"
+fi
 
 ask APP_DOMAIN     "دومين الموقع"           "${APP_DOMAIN:-meet.example.com}"
 ask LIVEKIT_DOMAIN "دومين LiveKit"          "${LIVEKIT_DOMAIN:-livekit.${APP_DOMAIN}}"
 ask ADMIN_EMAIL    "بريد الأدمن"            "${ADMIN_EMAIL:-admin@${APP_DOMAIN}}"
 ask ADMIN_PASSWORD "كلمة مرور الأدمن"       "${ADMIN_PASSWORD:-$(openssl rand -base64 12 | tr -d '/+=' | cut -c1-14)}"
 ask PUBLIC_IP      "IP العام للسيرفر"       "${PUBLIC_IP:-127.0.0.1}"
-ask ENABLE_TLS     "إصدار شهادة TLS تلقائيًا عبر Let's Encrypt؟ (y/n) — يتطلب توجيه DNS للنطاقين" "${ENABLE_TLS:-y}"
+ask ENABLE_TLS     "شهادة TLS تلقائية (Let's Encrypt)؟ y/n" "${ENABLE_TLS:-y}"
 
-log "الإعدادات: APP=$APP_DOMAIN  LIVEKIT=$LIVEKIT_DOMAIN  IP=$PUBLIC_IP  TLS=$ENABLE_TLS"
+say "\n"
+log "الإعدادات: APP=$APP_DOMAIN  LIVEKIT=$LIVEKIT_DOMAIN  IP=$PUBLIC_IP  TLS=$ENABLE_TLS  MODE=$MODE"
 
 # ============================================================================
 #  2) تحديد مصدر ملفات المشروع (محلي أو تنزيل الحزمة)
@@ -389,13 +420,13 @@ step_firewall(){
 }
 
 step_cleanup_timer(){
-  # مؤقّت تنظيف الاجتماعات المنتهية (حذف تلقائي بعد 24 ساعة)
+  # مؤقّت تنظيف الاجتماعات: أرشفة المنتهية للسجل، حذف صفّ الغرفة بعد ساعة، تقليم السجل بعد 30 يومًا
   [ -f "$SRC_DIR/scripts/cleanup.php" ] || { warn "cleanup.php غير موجود — تخطّي المؤقّت."; return 0; }
   cp -a "$SRC_DIR/scripts/cleanup.php" "$APP_DIR/scripts/" 2>/dev/null || { mkdir -p "$APP_DIR/scripts"; cp -a "$SRC_DIR/scripts/cleanup.php" "$APP_DIR/scripts/"; }
   chown -R www-data:www-data "$APP_DIR/scripts"
   cat > /etc/systemd/system/meet-cleanup.service <<UNIT
 [Unit]
-Description=Meet cleanup (close expired rooms + delete >24h ended meetings)
+Description=Meet cleanup (archive ended rooms to history, delete room row after 1h, prune history after 30d)
 After=network.target mysql.service
 [Service]
 Type=oneshot
@@ -421,7 +452,20 @@ UNIT
 #  تشغيل الخطوات بالترتيب (مع إعادة محاولة)
 # ============================================================================
 declare -i N=0
-run(){ N+=1; log "$N) $1"; if retry 2 "$1" "$2"; then ok "$1"; else die "فشل نهائيًا: $1"; fi; }
+TOTAL=13
+run(){ N+=1; local title="$1" fn="$2"
+  log "=== الخطوة $N/$TOTAL: $title ==="
+  ( retry 2 "$title" "$fn" ) &
+  local pid=$!
+  _spin "$pid" "$(printf '%s' "$title")"
+  if wait "$pid"; then
+    say "\r  ${CG}✓${C0} %s\033[K\n" "$title"; ok "$title"
+  else
+    say "\r  ${CR}✗${C0} %s\033[K\n" "$title"; die "فشل نهائيًا: $title"
+  fi
+}
+
+say "  ${CD}جارٍ التثبيت — لن يظهر إلا ملخّص كل خطوة (السجل الكامل: %s)${C0}\n\n" "$LOG_FILE"
 
 run "حزم أساسية + إزالة Docker"        step_base
 run "توليد/تحميل الأسرار (.env)"        step_env
@@ -447,7 +491,8 @@ declare -A HEAL=(
 SERVICES="mysql redis-server php${PHP_VER}-fpm livekit coturn nginx"
 
 log "التحقّق النهائي والإصلاح الذاتي"
-FAILED=""
+say "\n  ${CD}────────────────────────────────────────${C0}\n"
+( FAILED=""
 for s in $SERVICES; do
   for attempt in 1 2 3; do
     if systemctl is-active --quiet "$s"; then break; fi
@@ -455,8 +500,15 @@ for s in $SERVICES; do
     warn "$s ما زال متوقّفًا — إعادة تثبيت (${HEAL[$s]:-none})"
     fn="${HEAL[$s]:-}"; [ -n "$fn" ] && "$fn" 2>/dev/null || true; sleep 2
   done
+done ) &
+_spin "$!" "التحقّق من الخدمات والإصلاح الذاتي"
+wait "$!" 2>/dev/null || true
+
+FAILED=""
+for s in $SERVICES; do
   if systemctl is-active --quiet "$s"; then ok "خدمة $s تعمل"; else err "خدمة $s متوقّفة"; FAILED="$FAILED $s"; fi
 done
+say "\r  ${CG}✓${C0} التحقّق من الخدمات\033[K\n"
 
 # فحوص وظيفية
 sleep 2
@@ -490,18 +542,17 @@ TURN secret:   $TURN_SECRET
 CRED
 chmod 600 "$CRED_FILE"
 
-echo
-echo "=================================================="
+say "\n"
+say "  ${CD}════════════════════════════════════════${C0}\n"
 if [ -z "$FAILED" ]; then
-  printf "${CG}✓ التثبيت اكتمل وكل الخدمات تعمل${C0}\n"
+  say "  ${CG}${CB}✓ التثبيت اكتمل — كل الخدمات تعمل${C0}\n"
 else
-  printf "${CR}✗ اكتمل التثبيت لكن مع مشاكل في:%s${C0}\n" "$FAILED"
-  echo "  افحص: journalctl -u <الخدمة> -n50   والسجل: $LOG_FILE"
+  say "  ${CR}${CB}✗ اكتمل التثبيت مع مشاكل في:%s${C0}\n" "$FAILED"
+  say "  ${CD}افحص: journalctl -u <الخدمة> -n50   والسجل: %s${C0}\n" "$LOG_FILE"
 fi
-echo "--------------------------------------------------"
-echo "الموقع:   https://$APP_DOMAIN"
-echo "الأدمن:   $ADMIN_EMAIL"
-echo "البيانات: $CRED_FILE   (كلمات المرور كاملة هناك)"
-echo "ملاحظة: التسجيل يتم من المتصفح (client-side) وينزل محليًا — لا يتطلّب Egress."
-[ "${ENABLE_TLS,,}" = "y" ] || echo "TLS: لإصدار شهادة لاحقًا وجّه DNS ثم: ENABLE_TLS=y bash install.sh"
-echo "=================================================="
+say "  ${CD}────────────────────────────────────────${C0}\n"
+say "  الموقع:    ${CB}https://%s${C0}\n" "$APP_DOMAIN"
+say "  الأدمن:    %s\n" "$ADMIN_EMAIL"
+say "  البيانات:  ${CD}%s${C0}  ${CD}(كلمات المرور كاملة هناك)${C0}\n" "$CRED_FILE"
+[ "${ENABLE_TLS,,}" = "y" ] || say "  ${CY}TLS:${C0} ${CD}لإصدار شهادة لاحقًا وجّه DNS ثم: ENABLE_TLS=y bash install.sh${C0}\n"
+say "  ${CD}════════════════════════════════════════${C0}\n\n"
