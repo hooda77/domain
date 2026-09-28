@@ -21,6 +21,10 @@ set -Eeuo pipefail
 PHP_VER="${PHP_VER:-8.2}"
 LIVEKIT_VERSION="${LIVEKIT_VERSION:-1.13.7}"
 
+# ---- مصدر الحزمة الافتراضي (يُستخدم عند التشغيل عبر curl|bash) ----
+# لو شغّلت السكربت من داخل مجلد المشروع، تُستخدم الملفات المحلية ويُتجاهل هذا الرابط.
+BUNDLE_URL="${BUNDLE_URL:-https://github.com/hooda77/domain/raw/refs/heads/main/meet-platform.zip}"
+
 # ---- مسارات ----
 APP_DIR="/var/www/meet"
 REC_DIR="/var/lib/meet/recordings"
