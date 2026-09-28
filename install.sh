@@ -247,7 +247,25 @@ step_php(){
   add-apt-repository -y ppa:ondrej/php
   apt-get update -y
   apt-get install -y php${PHP_VER}-fpm php${PHP_VER}-mysql php${PHP_VER}-mbstring \
-    php${PHP_VER}-bcmath php${PHP_VER}-curl php${PHP_VER}-xml php${PHP_VER}-zip php${PHP_VER}-gd
+    php${PHP_VER}-bcmath php${PHP_VER}-curl php${PHP_VER}-xml php${PHP_VER}-zip php${PHP_VER}-gd \
+    php${PHP_VER}-redis php${PHP_VER}-opcache
+  # تفعيل OPcache لأداء أفضل (يُطبَّق على FPM + CLI)
+  local ini_dir="/etc/php/${PHP_VER}"
+  for sapi in fpm cli; do
+    local conf="${ini_dir}/${sapi}/conf.d/99-meet-opcache.ini"
+    [ -d "${ini_dir}/${sapi}/conf.d" ] || continue
+    cat > "$conf" <<'OPC'
+opcache.enable=1
+opcache.enable_cli=0
+opcache.memory_consumption=192
+opcache.interned_strings_buffer=16
+opcache.max_accelerated_files=20000
+opcache.validate_timestamps=1
+opcache.revalidate_freq=2
+opcache.jit=tracing
+opcache.jit_buffer_size=64M
+OPC
+  done
   systemctl enable --now php${PHP_VER}-fpm
   if ! command -v composer >/dev/null 2>&1; then
     php -r "copy('https://getcomposer.org/installer','/tmp/composer-setup.php');"
@@ -355,6 +373,32 @@ server {
     client_max_body_size 20m;
     add_header X-Frame-Options SAMEORIGIN always;
     add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy strict-origin-when-cross-origin always;
+
+    gzip on;
+    gzip_vary on;
+    gzip_comp_level 6;
+    gzip_min_length 1024;
+    gzip_proxied any;
+    gzip_types text/plain text/css application/javascript application/json image/svg+xml application/manifest+json font/ttf font/otf;
+
+    # الأصول المشتركة ذات ?v= : كاش طويل غير قابل للتغيير
+    location ^~ /assets/ {
+        access_log off;
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+        try_files \$uri =404;
+    }
+    location ~* \.(?:css|js|svg|woff2|woff|ttf|otf|eot|png|jpg|jpeg|gif|webp|ico)\$ {
+        access_log off;
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+        try_files \$uri =404;
+    }
+    # صفحات HTML: لا تُخزَّن (نسخة ?v= في الأصول تكسر الكاش)
+    location ~* \.html\$ {
+        add_header Cache-Control "no-cache" always;
+        try_files \$uri =404;
+    }
+
     location / { try_files \$uri \$uri/ \$uri.html =404; }
     location /api/ {
         include fastcgi_params;
