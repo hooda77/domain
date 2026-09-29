@@ -1,60 +1,63 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  install.sh — مثبِّت منصّة الاجتماعات (LiveKit + PHP + MySQL + nginx)
-#  • قابل لإعادة الاستخدام على أي سيرفر Ubuntu 22.04/24.04 (بصلاحية root)
-#  • يعمل من داخل مجلد المشروع، أو يحمّل الحزمة (.zip) من BUNDLE_URL
-#  • idempotent: يمكن إعادة تشغيله بأمان — لا يفقد بيانات ولا أسرارًا
-#  • ذاتي الإصلاح: يتحقّق من كل خدمة وما لا يعمل يعيد تشغيله ثم إعادة تثبيته
+#  install.sh — Meeting Platform installer (LiveKit + PHP + MySQL + nginx)
+#  • Reusable on any Ubuntu 22.04/24.04 server (requires root).
+#  • Runs from inside the project directory, or downloads the bundle (.zip)
+#    from BUNDLE_URL.
+#  • Idempotent: safe to re-run — never loses data or secrets.
+#  • Self-healing: verifies every service; whatever is down is restarted,
+#    then reinstalled if needed.
 #
-#  الاستخدام:
-#    sudo bash install.sh                       # تفاعلي (يسأل عن الدومين…)
+#  Usage:
+#    sudo bash install.sh                          # interactive (prompts for domain…)
 #    sudo APP_DOMAIN=meet.site.com \
 #         LIVEKIT_DOMAIN=lk.site.com \
 #         ADMIN_EMAIL=admin@site.com \
 #         ADMIN_PASSWORD=Str0ng! \
-#         MEET_NONINTERACTIVE=1 bash install.sh # صامت
-#    curl -fsSL <رابط>/install.sh | sudo BUNDLE_URL=<رابط .zip> bash
+#         MEET_NONINTERACTIVE=1 bash install.sh    # silent
+#    curl -fsSL <url>/install.sh | sudo BUNDLE_URL=<url .zip> bash
 # ============================================================================
 set -Eeuo pipefail
 
-# ---- إصدارات مثبّتة ----
+# ---- Pinned versions ----
 PHP_VER="${PHP_VER:-8.2}"
 LIVEKIT_VERSION="${LIVEKIT_VERSION:-1.13.7}"
 
-# ---- مصدر الحزمة الافتراضي (يُستخدم عند التشغيل عبر curl|bash) ----
-# لو شغّلت السكربت من داخل مجلد المشروع، تُستخدم الملفات المحلية ويُتجاهل هذا الرابط.
+# ---- Default bundle source (used when run via curl|bash) ----
+# When run from inside the project directory, local files are used and this
+# URL is ignored.
 BUNDLE_URL="${BUNDLE_URL:-https://github.com/hooda77/domain/raw/refs/heads/main/meet-platform.zip}"
 
-# ---- مسارات ----
+# ---- Paths ----
 APP_DIR="/var/www/meet"
 REC_DIR="/var/lib/meet/recordings"
 ENV_FILE="$APP_DIR/.env"
 CRED_FILE="/root/meet-credentials.txt"
 LOG_FILE="/var/log/meet-install.log"
 
-# ---- ألوان ----
+# ---- Colors ----
 if [ -t 1 ]; then C0='\033[0m'; C1='\033[1;36m'; CG='\033[1;32m'; CY='\033[1;33m'; CR='\033[1;31m'; CD='\033[2m'; CB='\033[1m'; else C0='' C1='' CG='' CY='' CR='' CD='' CB=''; fi
 
 export DEBIAN_FRONTEND=noninteractive
 mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
 : >"$LOG_FILE" 2>/dev/null || true
 
-# احفظ الطرفية على fd 3، ثم وجّه كل مخرجات الأوامر (apt/composer…) إلى السجل فقط
-# ليبقى ما يراه المستخدم نظيفًا واحترافيًا.
+# Keep the terminal on fd 3, then send all command output (apt/composer…) to the
+# log only, so what the user sees on screen stays clean and professional.
 exec 3>&1
 exec >>"$LOG_FILE" 2>&1
 
 _ts(){ date '+%H:%M:%S'; }
-say(){ printf "$@" >&3; }                                  # سطر نظيف على الشاشة
-log(){ printf '[%s] %s\n' "$(_ts)" "$*"; }                 # للسجل فقط
+say(){ printf "$@" >&3; }                                  # clean line on screen
+log(){ printf '[%s] %s\n' "$(_ts)" "$*"; }                 # log file only
 ok(){  log "OK: $*"; }
 warn(){ log "WARN: $*"; }
 err(){ log "ERR: $*"; }
-die(){ log "FATAL: $*"; say "\r  ${CR}✗${C0} %s\n" "$*"; say "  ${CD}راجع السجل: %s${C0}\n" "$LOG_FILE"; exit 1; }
+die(){ log "FATAL: $*"; say "\r  ${CR}✗${C0} %s\n" "$*"; say "  ${CD}See the log: %s${C0}\n" "$LOG_FILE"; exit 1; }
 
-trap 'log "فشل عند السطر $LINENO (الأمر: $BASH_COMMAND)"' ERR
+trap 'log "Failed at line $LINENO (command: $BASH_COMMAND)"' ERR
 
-# مؤشّر دوّار أثناء تنفيذ خطوة (يُخفي الإخراج المطوّل)
+# Spinner shown while a step runs (hides its verbose output)
 _spin(){
   local pid="$1" msg="$2" f='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' i=0
   while kill -0 "$pid" 2>/dev/null; do
@@ -65,29 +68,29 @@ _spin(){
 }
 
 # ============================================================================
-#  0) فحوص أولية
+#  0) Preflight checks
 # ============================================================================
-[ "$(id -u)" = "0" ] || die "شغّل السكربت بصلاحية root (استخدم sudo)."
-if ! command -v apt-get >/dev/null 2>&1; then die "هذا المثبّت لـ Ubuntu/Debian فقط (apt-get غير موجود)."; fi
+[ "$(id -u)" = "0" ] || die "Run this script as root (use sudo)."
+if ! command -v apt-get >/dev/null 2>&1; then die "This installer targets Ubuntu/Debian only (apt-get not found)."; fi
 . /etc/os-release 2>/dev/null || true
-log "النظام: ${PRETTY_NAME:-غير معروف}"
+log "System: ${PRETTY_NAME:-unknown}"
 
-# وضع التشغيل: تحديث (يوجد .env سابق) أم تثبيت جديد
-if [ -f "$ENV_FILE" ]; then MODE="update"; MODE_AR="تحديث"; else MODE="fresh"; MODE_AR="تثبيت جديد"; fi
+# Run mode: update (a previous .env exists) or a fresh install
+if [ -f "$ENV_FILE" ]; then MODE="update"; MODE_LABEL="Update"; else MODE="fresh"; MODE_LABEL="Fresh install"; fi
 
-# لافتة نظيفة
+# Clean banner
 say "\n"
-say "  ${CB}${C1}منصّة الاجتماعات${C0}  ${CD}·  المثبّت الاحترافي${C0}\n"
+say "  ${CB}${C1}Meeting Platform${C0}  ${CD}·  Professional installer${C0}\n"
 say "  ${CD}────────────────────────────────────────${C0}\n"
-say "  الوضع: ${CB}%s${C0}   ${CD}النظام: %s${C0}\n\n" "$MODE_AR" "${PRETTY_NAME:-Linux}"
+say "  Mode: ${CB}%s${C0}   ${CD}System: %s${C0}\n\n" "$MODE_LABEL" "${PRETTY_NAME:-Linux}"
 
 # ============================================================================
-#  1) قراءة الإعدادات (env أو تفاعليًا)
+#  1) Read configuration (from env or interactively)
 # ============================================================================
 NONINTERACTIVE="${MEET_NONINTERACTIVE:-0}"
-# عند التشغيل عبر «curl | bash» يكون stdin هو الأنبوب لا الطرفية،
-# لذا نقرأ من /dev/tty مباشرة إن كانت متاحة (وإلا نستخدم الافتراضي)
-ask(){ # ask VAR "السؤال" "الافتراضي"
+# When run via "curl | bash", stdin is the pipe rather than the terminal,
+# so we read from /dev/tty directly when available (otherwise use the default).
+ask(){ # ask VAR "question" "default"
   local __var="$1" __q="$2" __def="${3:-}" __ans=""
   local __cur="${!__var:-}"
   if [ -n "$__cur" ]; then eval "$__var=\$__cur"; return; fi
@@ -97,78 +100,78 @@ ask(){ # ask VAR "السؤال" "الافتراضي"
   eval "$__var=\${__ans:-\$__def}"
 }
 
-# IP العام (كشف تلقائي)
+# Public IP (auto-detect)
 detect_ip(){ curl -fsS4 https://api.ipify.org 2>/dev/null || curl -fsS4 https://ifconfig.me 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}'; }
 PUBLIC_IP="${PUBLIC_IP:-$(detect_ip)}"
 
-# لو يوجد .env سابق حمّل قيمه (حفاظًا على الأسرار والدومين)
+# If a previous .env exists, load its values (preserving secrets and domain)
 if [ "$MODE" = "update" ]; then
   set -a; . "$ENV_FILE"; set +a
-  say "  ${CG}✓${C0} إعداد سابق موجود — سيُعاد استخدام الأسرار والدومين.\n\n"
+  say "  ${CG}✓${C0} Existing configuration found — secrets and domain will be reused.\n\n"
 fi
 
-ask APP_DOMAIN     "دومين الموقع"           "${APP_DOMAIN:-meet.example.com}"
-ask LIVEKIT_DOMAIN "دومين LiveKit"          "${LIVEKIT_DOMAIN:-livekit.${APP_DOMAIN}}"
-ask ADMIN_EMAIL    "بريد الأدمن"            "${ADMIN_EMAIL:-admin@${APP_DOMAIN}}"
-ask ADMIN_PASSWORD "كلمة مرور الأدمن"       "${ADMIN_PASSWORD:-$(openssl rand -base64 12 | tr -d '/+=' | cut -c1-14)}"
-ask PUBLIC_IP      "IP العام للسيرفر"       "${PUBLIC_IP:-127.0.0.1}"
-ask ENABLE_TLS     "شهادة TLS تلقائية (Let's Encrypt)؟ y/n" "${ENABLE_TLS:-y}"
+ask APP_DOMAIN     "Site domain"                        "${APP_DOMAIN:-meet.example.com}"
+ask LIVEKIT_DOMAIN "LiveKit domain"                     "${LIVEKIT_DOMAIN:-livekit.${APP_DOMAIN}}"
+ask ADMIN_EMAIL    "Admin email"                        "${ADMIN_EMAIL:-admin@${APP_DOMAIN}}"
+ask ADMIN_PASSWORD "Admin password"                     "${ADMIN_PASSWORD:-$(openssl rand -base64 12 | tr -d '/+=' | cut -c1-14)}"
+ask PUBLIC_IP      "Server public IP"                   "${PUBLIC_IP:-127.0.0.1}"
+ask ENABLE_TLS     "Automatic TLS certificate (Let's Encrypt)? y/n" "${ENABLE_TLS:-y}"
 
 say "\n"
-log "الإعدادات: APP=$APP_DOMAIN  LIVEKIT=$LIVEKIT_DOMAIN  IP=$PUBLIC_IP  TLS=$ENABLE_TLS  MODE=$MODE"
+log "Config: APP=$APP_DOMAIN  LIVEKIT=$LIVEKIT_DOMAIN  IP=$PUBLIC_IP  TLS=$ENABLE_TLS  MODE=$MODE"
 
 # ============================================================================
-#  2) تحديد مصدر ملفات المشروع (محلي أو تنزيل الحزمة)
+#  2) Locate project files (local directory or download the bundle)
 # ============================================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo "$PWD")"
-find_src(){ # يبحث عن مجلد يحوي backend/ و public/
+find_src(){ # look for a directory that contains backend/ and public/
   for d in "$SCRIPT_DIR" "$SCRIPT_DIR/.." "$PWD"; do
     if [ -d "$d/backend" ] && [ -d "$d/public" ]; then (cd "$d" && pwd); return 0; fi
   done
   return 1
 }
 if SRC_DIR="$(find_src)"; then
-  ok "مصدر الملفات محليًا: $SRC_DIR"
+  ok "Local file source: $SRC_DIR"
 elif [ -n "${BUNDLE_URL:-}" ]; then
-  log "تنزيل الحزمة من: $BUNDLE_URL"
+  log "Downloading bundle from: $BUNDLE_URL"
   TMPD="$(mktemp -d)"; trap 'rm -rf "$TMPD"' EXIT
-  curl -fL --retry 3 -o "$TMPD/bundle.zip" "$BUNDLE_URL" || die "تعذّر تنزيل الحزمة من BUNDLE_URL"
+  curl -fL --retry 3 -o "$TMPD/bundle.zip" "$BUNDLE_URL" || die "Failed to download the bundle from BUNDLE_URL"
   mkdir -p "$TMPD/x"
-  # فكّ الضغط: unzip إن وُجد، وإلا ثبّته، وإلا استخدم python3 كخطة بديلة
+  # Extraction: use unzip if present, otherwise install it, otherwise fall back to python3
   if ! command -v unzip >/dev/null 2>&1; then
     apt-get update -y >/dev/null 2>&1 || true
     apt-get install -y unzip >/dev/null 2>&1 || true
   fi
   if command -v unzip >/dev/null 2>&1; then
-    unzip -q "$TMPD/bundle.zip" -d "$TMPD/x" || die "تعذّر فكّ الحزمة (unzip)"
+    unzip -q "$TMPD/bundle.zip" -d "$TMPD/x" || die "Failed to extract the bundle (unzip)"
   elif command -v python3 >/dev/null 2>&1; then
-    python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$TMPD/bundle.zip" "$TMPD/x" || die "تعذّر فكّ الحزمة (python3)"
+    python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$TMPD/bundle.zip" "$TMPD/x" || die "Failed to extract the bundle (python3)"
   else
-    die "لا يوجد unzip ولا python3 لفكّ الحزمة."
+    die "Neither unzip nor python3 is available to extract the bundle."
   fi
-  # ابحث عن جذر المشروع داخل ما فُكّ (قد يكون داخل مجلد فرعي)
+  # Find the project root inside the extracted files (it may be in a subdirectory)
   ROOT="$(find "$TMPD/x" -maxdepth 3 -type d -name backend -printf '%h\n' 2>/dev/null | head -1)"
-  [ -n "$ROOT" ] && [ -d "$ROOT/public" ] || die "لم أجد backend/ و public/ داخل الحزمة"
-  SRC_DIR="$ROOT"; ok "تم فكّ الحزمة: $SRC_DIR"
+  [ -n "$ROOT" ] && [ -d "$ROOT/public" ] || die "Could not find backend/ and public/ inside the bundle"
+  SRC_DIR="$ROOT"; ok "Bundle extracted: $SRC_DIR"
 else
-  die "لا توجد ملفات المشروع محليًا ولا BUNDLE_URL. ضع install.sh بجوار backend/ و public/ أو مرّر BUNDLE_URL=<رابط .zip>."
+  die "No local project files and no BUNDLE_URL. Place install.sh next to backend/ and public/, or pass BUNDLE_URL=<url .zip>."
 fi
 
 # ============================================================================
-#  آلية إعادة المحاولة العامة
+#  Generic retry helper
 # ============================================================================
-retry(){ # retry <مرّات> <وصف> <أمر...>
+retry(){ # retry <times> <description> <command...>
   local n="$1" desc="$2"; shift 2
   local i=1
   while [ "$i" -le "$n" ]; do
     if "$@"; then return 0; fi
-    warn "«$desc» فشل (محاولة $i/$n) — إعادة خلال 3ث…"; sleep 3; i=$((i+1))
+    warn "\"$desc\" failed (attempt $i/$n) — retrying in 3s…"; sleep 3; i=$((i+1))
   done
   return 1
 }
 
 # ============================================================================
-#  خطوات التثبيت (كل واحدة idempotent)
+#  Install steps (each one is idempotent)
 # ============================================================================
 gen(){ openssl rand -hex "${1:-24}"; }
 
@@ -249,7 +252,7 @@ step_php(){
   apt-get install -y php${PHP_VER}-fpm php${PHP_VER}-mysql php${PHP_VER}-mbstring \
     php${PHP_VER}-bcmath php${PHP_VER}-curl php${PHP_VER}-xml php${PHP_VER}-zip php${PHP_VER}-gd \
     php${PHP_VER}-redis php${PHP_VER}-opcache
-  # تفعيل OPcache لأداء أفضل (يُطبَّق على FPM + CLI)
+  # Enable OPcache for better performance (applied to FPM + CLI)
   local ini_dir="/etc/php/${PHP_VER}"
   for sapi in fpm cli; do
     local conf="${ini_dir}/${sapi}/conf.d/99-meet-opcache.ini"
@@ -289,10 +292,10 @@ step_deploy(){
 
 step_db(){
   mysql -uroot meet < "$APP_DIR/db/schema.sql"
-  # طبّق كل ملفات الهجرة الموجودة (بالترتيب)
+  # Apply every migration file present (in order)
   if [ -d "$APP_DIR/db/migrations" ]; then
     for m in $(ls -1 "$APP_DIR/db/migrations"/*.sql 2>/dev/null | sort); do
-      mysql -uroot meet < "$m" || warn "هجرة تخطّت (قد تكون مطبّقة): $(basename "$m")"
+      mysql -uroot meet < "$m" || warn "Migration skipped (may already be applied): $(basename "$m")"
     done
   fi
   local hash
@@ -302,7 +305,7 @@ INSERT INTO users (email,password_hash,name,role)
 VALUES ('$ADMIN_EMAIL','$hash','Admin','admin')
 ON DUPLICATE KEY UPDATE role='admin';
 INSERT INTO nodes (name,host,ssh_user,ssh_port,region,is_main,status,last_seen)
-VALUES ('السيرفر الأساسي','$PUBLIC_IP','root',22,'main',1,'online',NOW())
+VALUES ('Primary server','$PUBLIC_IP','root',22,'main',1,'online',NOW())
 ON DUPLICATE KEY UPDATE is_main=1,status='online',last_seen=NOW();
 SQL
 }
@@ -382,7 +385,7 @@ server {
     gzip_proxied any;
     gzip_types text/plain text/css application/javascript application/json image/svg+xml application/manifest+json font/ttf font/otf;
 
-    # الأصول المشتركة ذات ?v= : كاش طويل غير قابل للتغيير
+    # Shared assets carrying ?v= : long-lived immutable cache
     location ^~ /assets/ {
         access_log off;
         add_header Cache-Control "public, max-age=31536000, immutable" always;
@@ -393,7 +396,7 @@ server {
         add_header Cache-Control "public, max-age=31536000, immutable" always;
         try_files \$uri =404;
     }
-    # صفحات HTML: لا تُخزَّن (نسخة ?v= في الأصول تكسر الكاش)
+    # HTML pages: never cached (the ?v= on assets busts the cache)
     location ~* \.html\$ {
         add_header Cache-Control "no-cache" always;
         try_files \$uri =404;
@@ -437,7 +440,7 @@ NGINX
 }
 
 step_tls(){
-  [ "${ENABLE_TLS,,}" = "y" ] || { warn "تم تخطّي TLS (ENABLE_TLS=$ENABLE_TLS) — nginx على شهادة ذاتية."; return 0; }
+  [ "${ENABLE_TLS,,}" = "y" ] || { warn "TLS skipped (ENABLE_TLS=$ENABLE_TLS) — nginx keeps the self-signed cert."; return 0; }
   local LE=""
   if certbot certonly --webroot -w /var/www/certbot -d "$APP_DOMAIN" -d "$LIVEKIT_DOMAIN" \
        --non-interactive --agree-tos -m "$ADMIN_EMAIL" 2>/tmp/cb.log; then
@@ -446,12 +449,12 @@ step_tls(){
        --non-interactive --agree-tos -m "$ADMIN_EMAIL" 2>>/tmp/cb.log; then
     LE="/etc/letsencrypt/live/$LIVEKIT_DOMAIN"
   else
-    warn "تعذّر إصدار شهادة Let's Encrypt (تحقّق من DNS) — يبقى على الشهادة الذاتية. راجع /tmp/cb.log"; return 0
+    warn "Could not issue a Let's Encrypt certificate (check DNS) — keeping the self-signed cert. See /tmp/cb.log"; return 0
   fi
   if [ -n "$LE" ] && [ -f "$LE/fullchain.pem" ]; then
     sed -i "s#$SS/fullchain.pem#$LE/fullchain.pem#g; s#$SS/privkey.pem#$LE/privkey.pem#g" \
       /etc/nginx/sites-available/meet.conf
-    nginx -t && systemctl reload nginx && ok "TLS مُفعّل عبر Let's Encrypt"
+    nginx -t && systemctl reload nginx && ok "TLS enabled via Let's Encrypt"
   fi
 }
 
@@ -464,8 +467,9 @@ step_firewall(){
 }
 
 step_cleanup_timer(){
-  # مؤقّت تنظيف الاجتماعات: أرشفة المنتهية للسجل، حذف صفّ الغرفة بعد ساعة، تقليم السجل بعد 30 يومًا
-  [ -f "$SRC_DIR/scripts/cleanup.php" ] || { warn "cleanup.php غير موجود — تخطّي المؤقّت."; return 0; }
+  # Cleanup timer: archive ended meetings to history, delete the room row after
+  # one hour, prune history after 30 days.
+  [ -f "$SRC_DIR/scripts/cleanup.php" ] || { warn "cleanup.php not found — skipping the timer."; return 0; }
   cp -a "$SRC_DIR/scripts/cleanup.php" "$APP_DIR/scripts/" 2>/dev/null || { mkdir -p "$APP_DIR/scripts"; cp -a "$SRC_DIR/scripts/cleanup.php" "$APP_DIR/scripts/"; }
   chown -R www-data:www-data "$APP_DIR/scripts"
   cat > /etc/systemd/system/meet-cleanup.service <<UNIT
@@ -493,40 +497,40 @@ UNIT
 }
 
 # ============================================================================
-#  تشغيل الخطوات بالترتيب (مع إعادة محاولة)
+#  Run the steps in order (with retries)
 # ============================================================================
 declare -i N=0
 TOTAL=13
 run(){ N+=1; local title="$1" fn="$2"
-  log "=== الخطوة $N/$TOTAL: $title ==="
+  log "=== Step $N/$TOTAL: $title ==="
   ( retry 2 "$title" "$fn" ) &
   local pid=$!
   _spin "$pid" "$(printf '%s' "$title")"
   if wait "$pid"; then
     say "\r  ${CG}✓${C0} %s\033[K\n" "$title"; ok "$title"
   else
-    say "\r  ${CR}✗${C0} %s\033[K\n" "$title"; die "فشل نهائيًا: $title"
+    say "\r  ${CR}✗${C0} %s\033[K\n" "$title"; die "Failed permanently: $title"
   fi
 }
 
-say "  ${CD}جارٍ التثبيت — لن يظهر إلا ملخّص كل خطوة (السجل الكامل: %s)${C0}\n\n" "$LOG_FILE"
+say "  ${CD}Installing — only a summary of each step is shown (full log: %s)${C0}\n\n" "$LOG_FILE"
 
-run "حزم أساسية + إزالة Docker"        step_base
-run "توليد/تحميل الأسرار (.env)"        step_env
-run "MySQL"                             step_mysql
+run "Base packages + remove Docker"      step_base
+run "Generate/load secrets (.env)"       step_env
+run "MySQL"                              step_mysql
 run "Redis"                             step_redis
-run "PHP ${PHP_VER}-FPM + Composer"     step_php
-run "نشر ملفات التطبيق"                 step_deploy
-run "المخطط + الهجرات + الأدمن"         step_db
-run "LiveKit ${LIVEKIT_VERSION}"        step_livekit
-run "coturn (TURN/STUN)"                step_coturn
+run "PHP ${PHP_VER}-FPM + Composer"      step_php
+run "Deploy application files"           step_deploy
+run "Schema + migrations + admin"        step_db
+run "LiveKit ${LIVEKIT_VERSION}"         step_livekit
+run "coturn (TURN/STUN)"                 step_coturn
 run "nginx"                             step_nginx
-run "شهادة TLS"                         step_tls
-run "الجدار الناري (ufw)"               step_firewall
-run "مؤقّت التنظيف الدوري"              step_cleanup_timer
+run "TLS certificate"                    step_tls
+run "Firewall (ufw)"                     step_firewall
+run "Periodic cleanup timer"             step_cleanup_timer
 
 # ============================================================================
-#  التحقّق النهائي + الإصلاح الذاتي
+#  Final verification + self-healing
 # ============================================================================
 declare -A HEAL=(
   [mysql]=step_mysql [redis-server]=step_redis [php${PHP_VER}-fpm]=step_php
@@ -534,46 +538,46 @@ declare -A HEAL=(
 )
 SERVICES="mysql redis-server php${PHP_VER}-fpm livekit coturn nginx"
 
-log "التحقّق النهائي والإصلاح الذاتي"
+log "Final verification and self-healing"
 say "\n  ${CD}────────────────────────────────────────${C0}\n"
 ( FAILED=""
 for s in $SERVICES; do
   for attempt in 1 2 3; do
     if systemctl is-active --quiet "$s"; then break; fi
-    if [ "$attempt" = 1 ]; then warn "$s متوقّف — محاولة إعادة التشغيل"; systemctl restart "$s" 2>/dev/null || true; sleep 2; continue; fi
-    warn "$s ما زال متوقّفًا — إعادة تثبيت (${HEAL[$s]:-none})"
+    if [ "$attempt" = 1 ]; then warn "$s is down — attempting restart"; systemctl restart "$s" 2>/dev/null || true; sleep 2; continue; fi
+    warn "$s still down — reinstalling (${HEAL[$s]:-none})"
     fn="${HEAL[$s]:-}"; [ -n "$fn" ] && "$fn" 2>/dev/null || true; sleep 2
   done
 done ) &
-_spin "$!" "التحقّق من الخدمات والإصلاح الذاتي"
+_spin "$!" "Checking services and self-healing"
 wait "$!" 2>/dev/null || true
 
 FAILED=""
 for s in $SERVICES; do
-  if systemctl is-active --quiet "$s"; then ok "خدمة $s تعمل"; else err "خدمة $s متوقّفة"; FAILED="$FAILED $s"; fi
+  if systemctl is-active --quiet "$s"; then ok "service $s is running"; else err "service $s is down"; FAILED="$FAILED $s"; fi
 done
-say "\r  ${CG}✓${C0} التحقّق من الخدمات\033[K\n"
+say "\r  ${CG}✓${C0} Service check\033[K\n"
 
-# فحوص وظيفية
+# Functional checks
 sleep 2
 LK="$(curl -sS http://127.0.0.1:7880/ -o /dev/null -w '%{http_code}' 2>/dev/null || echo 000)"
-[ "$LK" != 000 ] && ok "LiveKit HTTP يستجيب ($LK)" || { err "LiveKit لا يستجيب"; FAILED="$FAILED livekit-http"; }
+[ "$LK" != 000 ] && ok "LiveKit HTTP responds ($LK)" || { err "LiveKit is not responding"; FAILED="$FAILED livekit-http"; }
 API="$(curl -sS -k https://127.0.0.1/api/auth/me -H "Host: $APP_DOMAIN" -o /dev/null -w '%{http_code}' 2>/dev/null || echo 000)"
-if [ "$API" = 401 ] || [ "$API" = 200 ]; then ok "الـ API يستجيب ($API)"; else err "الـ API لا يستجيب ($API)"; FAILED="$FAILED api"; fi
+if [ "$API" = 401 ] || [ "$API" = 200 ]; then ok "API responds ($API)"; else err "API is not responding ($API)"; FAILED="$FAILED api"; fi
 
 # ============================================================================
-#  حفظ بيانات الدخول + التقرير
+#  Save credentials + final report
 # ============================================================================
 set -a; . "$ENV_FILE"; set +a
 cat > "$CRED_FILE" <<CRED
-منصّة الاجتماعات — بيانات التثبيت ($(date))
+Meeting Platform — installation credentials ($(date))
 ================================================
-الموقع:        https://$APP_DOMAIN
+Site:          https://$APP_DOMAIN
 LiveKit:       wss://$LIVEKIT_DOMAIN
-IP العام:      $PUBLIC_IP
+Public IP:     $PUBLIC_IP
 ------------------------------------------------
-أدمن (بريد):   $ADMIN_EMAIL
-أدمن (كلمة):   $ADMIN_PASSWORD    ← غيّرها بعد أول دخول
+Admin (email): $ADMIN_EMAIL
+Admin (pass):  $ADMIN_PASSWORD    <- change it after first login
 ------------------------------------------------
 DB user:       meet / $DB_PASSWORD
 DB root:       $DB_ROOT_PASSWORD
@@ -582,21 +586,21 @@ LiveKit key:   $LIVEKIT_API_KEY
 LiveKit secret:$LIVEKIT_API_SECRET
 TURN secret:   $TURN_SECRET
 ================================================
-الأسرار محفوظة أيضًا في: $ENV_FILE
+Secrets are also stored in: $ENV_FILE
 CRED
 chmod 600 "$CRED_FILE"
 
 say "\n"
 say "  ${CD}════════════════════════════════════════${C0}\n"
 if [ -z "$FAILED" ]; then
-  say "  ${CG}${CB}✓ التثبيت اكتمل — كل الخدمات تعمل${C0}\n"
+  say "  ${CG}${CB}✓ Installation complete — all services are running${C0}\n"
 else
-  say "  ${CR}${CB}✗ اكتمل التثبيت مع مشاكل في:%s${C0}\n" "$FAILED"
-  say "  ${CD}افحص: journalctl -u <الخدمة> -n50   والسجل: %s${C0}\n" "$LOG_FILE"
+  say "  ${CR}${CB}✗ Installation finished with problems in:%s${C0}\n" "$FAILED"
+  say "  ${CD}Inspect: journalctl -u <service> -n50   and the log: %s${C0}\n" "$LOG_FILE"
 fi
 say "  ${CD}────────────────────────────────────────${C0}\n"
-say "  الموقع:    ${CB}https://%s${C0}\n" "$APP_DOMAIN"
-say "  الأدمن:    %s\n" "$ADMIN_EMAIL"
-say "  البيانات:  ${CD}%s${C0}  ${CD}(كلمات المرور كاملة هناك)${C0}\n" "$CRED_FILE"
-[ "${ENABLE_TLS,,}" = "y" ] || say "  ${CY}TLS:${C0} ${CD}لإصدار شهادة لاحقًا وجّه DNS ثم: ENABLE_TLS=y bash install.sh${C0}\n"
+say "  Site:     ${CB}https://%s${C0}\n" "$APP_DOMAIN"
+say "  Admin:    %s\n" "$ADMIN_EMAIL"
+say "  Details:  ${CD}%s${C0}  ${CD}(full passwords are there)${C0}\n" "$CRED_FILE"
+[ "${ENABLE_TLS,,}" = "y" ] || say "  ${CY}TLS:${C0} ${CD}to issue a certificate later, point DNS then run: ENABLE_TLS=y bash install.sh${C0}\n"
 say "  ${CD}════════════════════════════════════════${C0}\n\n"
